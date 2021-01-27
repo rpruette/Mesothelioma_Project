@@ -1,0 +1,209 @@
+---
+title: "Predicting Mesothelioma"
+author: "Rob Pruette"
+output: html_document
+---
+
+```{r message=FALSE, warning=FALSE}
+library(caret)
+library(ggplot2)
+library(corrplot)
+library(pROC)
+library(Hmisc)
+library(tidyr)
+library(OptimalCutpoints)
+library(glmnet)
+library(factoextra)
+library(cluster)
+library(dplyr)
+```
+
+```{r}
+# Read in Data
+meso <- read.csv("/Users/rob.pruette/Documents/SMU Spring 2020/STAT 6302/Final Project/MesotheliomaData.csv")
+
+# 34 features, 1 outcome, and 324 observations
+dim(meso)
+```
+
+```{r, echo = TRUE, results = "hide"}
+summary(meso)
+```
+
+```{r}
+# There is a correlation of -1 between diagnosis method and the diagnosis outcome
+cor(meso$diagnosis.method, meso$class.of.diagnosis)
+```
+
+```{r}
+# Function that makes a nice matrix with all the correlations
+flattenCorrMatrix <- function(cormat, pmat) {
+  ut <- upper.tri(cormat)
+  data.frame(
+    row = rownames(cormat)[row(cormat)[ut]],
+    column = rownames(cormat)[col(cormat)[ut]],
+    cor  =(cormat)[ut],
+    p = pmat[ut]
+  )
+}
+# correlations between all variables
+res2 <- rcorr(as.matrix(meso))
+correlation.matrix <- flattenCorrMatrix(res2$r, res2$P)
+
+# correlations greater than 0.5
+correlation.matrix[which(abs(correlation.matrix$cor) > 0.6),]
+
+# correlations with outcome variable
+correlation.matrix[which(correlation.matrix$column == "class.of.diagnosis"),]
+```
+
+```{r}
+# Create new outcome variable that is binary 0, 1
+meso$diagnosis_label <- ifelse(meso$class.of.diagnosis == 2, "Mesothelioma", "Healthy")
+
+# The following variables are numeric, but they represent factors
+# Change the variable to factors for analysis
+meso$city <- as.factor(meso$city)
+meso$keep.side <- as.factor(meso$keep.side)
+meso$habit.of.cigarette <- as.factor(meso$habit.of.cigarette)
+
+meso_dummy <- model.matrix(diagnosis_label ~ ., data = meso)[,-1]
+
+# Near Zero Variance
+nearZeroVar(meso_dummy, freqCut = 95/5, saveMetrics = FALSE, names = TRUE)
+table(meso$city)
+```
+```{r}
+# New data set with variables removed
+remove.indices <- which(colnames(meso) == "diagnosis.method" | colnames(meso) == "class.of.diagnosis" | colnames(meso) == "type.of.MM")
+meso2 <- meso[,-remove.indices]
+
+# bin the city variable so that cities 5, 7, and 8 are one level
+table(meso2$city)
+meso2$city <- as.numeric(meso2$city) - 1
+table(meso2$city)
+meso2[which(meso2$city == 5 | meso2$city == 8),]$city <- 7
+meso2$city <- factor(meso2$city)
+table(meso2$city)
+
+# Make the outcome variable a factor
+meso2$diagnosis_label <- as.factor(meso2$diagnosis_label)
+```
+
+```{r}
+# Create a dataset with dummy variables to see what columns have low variance
+# City 7 still has low variance, but combining it with another level seems questionable
+meso2_dummy <- model.matrix(diagnosis_label ~ ., data = meso2)[,-1]
+nearZeroVar(meso2_dummy, freqCut = 95/5, saveMetrics = FALSE, names = TRUE)
+
+# No information rate
+no_info_rate <- length(which(meso2$diagnosis_label == "Healthy")) / nrow(meso2)
+no_info_rate
+```
+
+```{r}
+############################################################
+# Cross Validated Logistic Regression (Model 1)
+############################################################
+set.seed(256)
+logisticRegCV <- train(diagnosis_label ~ ., data = meso2,
+                     method = "glm", trControl = trainControl(method = "repeatedcv",
+                                                              number = 10,
+                                                              repeats = 10, savePredictions = TRUE,
+                                                              classProbs = TRUE))
+as.data.frame(coef(logisticRegCV$finalModel))
+# Results report an accuracy of 0.6945 and a Kappa statistics of 0.2087
+model1_accuracy <- logisticRegCV$results$Accuracy
+model1_kappa<- logisticRegCV$results$Kappa
+
+# This loop using the confusion matrix from the model output to calculate sensitivity and specificity.
+# Accuracy is also calculated and results in the same value as the model results ouput
+logisticRegCV_accuracy <- array()
+logisticRegCV_sens <- array()
+logisticRegCV_spec <- array()
+for (i in 1:100){
+  logisticRegCV_accuracy[i] <- (logisticRegCV$resampledCM[i,1] + logisticRegCV$resampledCM[i,4]) / sum(logisticRegCV$resampledCM[i,1:4])
+  logisticRegCV_sens[i] <- logisticRegCV$resampledCM[i,1] / sum(logisticRegCV$resampledCM[i,c(1,3)])
+  logisticRegCV_spec[i] <- logisticRegCV$resampledCM[i,4] / sum(logisticRegCV$resampledCM[i,c(2,4)])
+}
+# Accuracy
+mean(logisticRegCV_accuracy)
+# Sensitivity
+model1_sensitivity <- mean(logisticRegCV_sens)
+# Specificity
+model1_specificity <- mean(logisticRegCV_spec)
+
+# Identify an optimal cutpoint
+m1_pred_df <- data.frame(logisticRegCV$pred)
+head(m1_pred_df)
+
+m1_preds <- data.frame(prob = predict(logisticRegCV, type = "prob")[,2])
+m1_preds$pred <- predict(logisticRegCV)
+m1_preds$obs <- meso2$diagnosis_label
+head(m1_preds)
+optcut0 <- summary(optimal.cutpoints(X = "prob", status = "obs", data = m1_preds, 
+                                     tag.healthy = "Healthy", methods = "MaxKappa"))
+final_cut0 <- optcut0$MaxKappa$Global$optimal.cutoff$cutoff
+final_cut0
+m1_pred_df$new_pred_label <- as.factor(ifelse(m1_pred_df$Mesothelioma > final_cut0, "Mesothelioma", "Healthy"))
+
+# Create binary variables to use in the calculation of the Brier score
+m1_pred_df$brier <- ifelse(m1_pred_df$obs == "Healthy", 0, 1)
+head(m1_pred_df)
+
+# Calculate the brier score for model 1
+brier_empty <- array()
+for (i in 1:nrow(m1_pred_df)){
+  brier_empty[i] <- (m1_pred_df$Mesothelioma[i] - m1_pred_df$brier[i])**2
+  }
+model1_brier <- mean(brier_empty)
+model1_brier
+
+
+# Calculate the accuracy, kappa, sensitivity, and specificity again using the new cutpoint
+rep_accuracy0 <- array()
+rep_sens0 <- array()
+rep_spec0 <- array()
+folds0 <- list()
+kappa0 <- array()
+count0 <- 1
+for (j in 1:10){
+  for(i in 1:10){
+    if(j<10 & i<10){
+      locator <- paste("Fold0", as.character(j), ".Rep0", as.character(i), sep = "")
+    }else if(j >= 10 & i < 10){
+      locator <- paste("Fold", as.character(j), ".Rep0", as.character(i), sep = "")
+    }else if(j<10 & i >= 10){
+      locator <- paste("Fold0", as.character(j), ".Rep", as.character(i), sep = "")
+    }else{
+      locator <- paste("Fold", as.character(j), ".Rep", as.character(i), sep = "")
+    }
+    df <- as.data.frame(m1_pred_df[which(m1_pred_df$Resample == locator), ])
+    CM <- confusionMatrix(data = df$new_pred_label, reference = df$obs)
+    rep_accuracy0[count0] <- CM$overall["Accuracy"]
+    rep_sens0[count0] <- CM$byClass["Sensitivity"]
+    rep_spec0[count0] <- CM$byClass["Specificity"]
+    kappa0[count0] <- CM$overall["Kappa"]
+    count0 = count0 +1
+    folds0[count0] <- locator
+  }
+}
+model1.1_accuracy <- mean(rep_accuracy0)
+model1.1_sensitivity <- mean(rep_sens0)
+model1.1_specificity <- mean(rep_spec0)
+model1.1_kappa <- mean(kappa0)
+
+
+# Using all the predicted data from the cross validation, examine calibration plot and ROC plot
+
+# Calibration plot
+calData <- calibration(obs ~ Mesothelioma, data = m1_pred_df, cuts = 10, class = "Mesothelioma")
+xyplot(calData, auto.key = list(columns = 2))
+
+# ROC Plot
+mesoROC1 <- roc(m1_preds$obs, m1_preds$prob, class = "Mesothelioma")
+model1_auc <- auc(mesoROC1)
+model1_ci <- ci.auc(mesoROC1)
+plot(mesoROC1, legacy.axes = TRUE)
+```
+
